@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import re
 import shutil
 import stat as statmod
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import rich_click as click
 
-from .config import ConfigError, SYNC_LEVELS, load_config, resolve_remote_endpoint_id
+from .config import (
+    ConfigError,
+    SYNC_LEVELS,
+    default_config_path,
+    load_config,
+    render_init_config_toml,
+    resolve_remote_endpoint_id,
+)
 from .errors import GlobusUsableError
 from .globus_cli import parse_json
 from .log import configure_logger
@@ -61,6 +70,14 @@ def _local_ls(path: Path, *, long: bool, show_all: bool) -> str:
 def cli() -> None:
     """Globus CLI wrapper with rsync-like semantics."""
     configure_logger()
+
+
+_REMOTE_NAME_ALLOWED_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _slug_remote_name(value: str) -> str:
+    slug = _REMOTE_NAME_ALLOWED_RE.sub("-", value.strip().lower()).strip("-")
+    return slug or "remote"
 
 
 @cli.command()
@@ -270,3 +287,186 @@ def cancel(task_id: str | None, cancel_all: bool) -> None:
     tid = data[0]["task_id"]
     run_globus("task", "cancel", tid)
     click.echo(f"Cancelled task {tid}.")
+
+
+@cli.group()
+def config() -> None:
+    """Manage the globus-usable config file."""
+
+
+@config.command("list")
+@click.option(
+    "--path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Config file path (default: ~/.config/globus-usable/remotes.toml)",
+)
+def config_list(path: Path | None) -> None:
+    """Show the loaded config and its location."""
+    config_path = path or default_config_path()
+    try:
+        cfg = load_config(config_path)
+    except (ConfigError, GlobusUsableError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Config path: {config_path}")
+    click.echo(f"Local endpoint_id: {cfg.local_endpoint_id or '(missing)'}")
+    click.echo("Remotes:")
+    if cfg.remotes:
+        for name, endpoint_id in sorted(cfg.remotes.items(), key=lambda kv: kv[0]):
+            suffix = " (default)" if name == cfg.defaults.default_remote else ""
+            click.echo(f"  - {name} = {endpoint_id}{suffix}")
+    else:
+        click.echo("  (none)")
+    click.echo("Defaults:")
+    click.echo(f"  default_remote = {cfg.defaults.default_remote}")
+    click.echo(f"  sync_level = {cfg.defaults.sync_level}")
+    click.echo(f"  poll_interval_min = {cfg.defaults.poll_interval_min:g}")
+    click.echo(f"  poll_interval_max = {cfg.defaults.poll_interval_max:g}")
+
+
+@config.command("init")
+@click.option(
+    "--path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Config file path (default: ~/.config/globus-usable/remotes.toml)",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite an existing config file",
+)
+@click.option(
+    "--autopopulate-linked-collections",
+    is_flag=True,
+    help="Populate [remotes.*] from linked (mapped) collections you can access",
+)
+def config_init(path: Path | None, force: bool, autopopulate_linked_collections: bool) -> None:
+    """Create a starter config file."""
+    ctx = click.get_current_context()
+    if ctx.get_parameter_source("autopopulate_linked_collections") == click.core.ParameterSource.DEFAULT:
+        if sys.stdin is not None and sys.stdin.isatty():
+            autopopulate_linked_collections = click.confirm(
+                "Autopopulate config with UUIDs of linked collections you can access (writes them under [remotes.*])?",
+                default=True,
+            )
+        else:
+            autopopulate_linked_collections = False
+
+    config_path = path or default_config_path()
+    if config_path.exists() and not force:
+        raise click.ClickException(f"Config already exists at {config_path}; use --force to overwrite.")
+
+    local_endpoint_id: str | None = None
+    local_endpoint_error: str | None = None
+    try:
+        local_endpoint_id = run_globus("endpoint", "local-id").strip() or None
+    except GlobusUsableError as exc:
+        local_endpoint_error = str(exc)
+
+    remotes: dict[str, str] = {}
+    default_remote: str | None = None
+
+    if autopopulate_linked_collections:
+        try:
+            collections = _discover_accessible_linked_collections()
+        except GlobusUsableError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        used_names: set[str] = set()
+        for display_name, collection_id in collections:
+            base = _slug_remote_name(display_name)
+            name = base
+            suffix = 2
+            while name in used_names:
+                name = f"{base}-{suffix}"
+                suffix += 1
+            used_names.add(name)
+            remotes[name] = collection_id
+
+        if remotes:
+            default_remote = sorted(remotes.keys())[0]
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        render_init_config_toml(
+            remotes=remotes,
+            default_remote=default_remote,
+            local_endpoint_id=local_endpoint_id,
+        ),
+        encoding="utf-8",
+    )
+    click.echo(f"Wrote config to {config_path}")
+
+    if local_endpoint_id:
+        click.echo(f"Local endpoint_id = {local_endpoint_id}")
+    else:
+        detail = f" ({local_endpoint_error})" if local_endpoint_error else ""
+        click.secho(
+            "Warning: local endpoint_id not detected; config contains a placeholder. "
+            f"Run `globus endpoint local-id` and update [local].endpoint_id{detail}.",
+            fg="yellow",
+            err=True,
+        )
+
+    if autopopulate_linked_collections and not remotes:
+        click.echo("No linked collections found (or none accessible); wrote a starter config without [remotes.*].")
+        return
+
+    if remotes:
+        click.echo("Populated remotes:")
+        for name, collection_id in sorted(remotes.items(), key=lambda kv: kv[0]):
+            click.echo(f"  - {name} = {collection_id}")
+
+        example_remote = sorted(remotes.keys())[0]
+        click.echo("Usage examples:")
+        click.echo(f"  globus-usable ls {example_remote}:/")
+        click.echo(f"  globus-usable cp ./local-file.txt {example_remote}:/path/")
+        click.echo("Custom config location:")
+        click.echo("  globus-usable config init --path /path/to/remotes.toml")
+
+
+def _discover_accessible_linked_collections() -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    seen_ids: set[str] = set()
+
+    def is_linked_collection_entity_type(value: object) -> bool:
+        if not isinstance(value, str):
+            return False
+        normalized = value.strip().lower()
+        return (
+            normalized.endswith("_mapped_collection")
+            or normalized.endswith("_guest_collection")
+            or normalized == "gcsv4_share"
+        )
+
+    out = run_globus(
+        "endpoint",
+        "search",
+        "--filter-scope",
+        "my-endpoints",
+        "--limit",
+        "1000",
+        "--format",
+        "json",
+    )
+    data = _json_data(out, "searching my-endpoints for linked collections")
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        entity_type = entry.get("entity_type")
+        if not is_linked_collection_entity_type(entity_type):
+            continue
+        collection_id = entry.get("id")
+        if not isinstance(collection_id, str) or not collection_id.strip():
+            continue
+        if collection_id in seen_ids:
+            continue
+        seen_ids.add(collection_id)
+        display = entry.get("display_name")
+        display_name = display.strip() if isinstance(display, str) and display.strip() else collection_id
+        items.append((display_name, collection_id))
+
+    items.sort(key=lambda x: x[0].lower())
+    return items
