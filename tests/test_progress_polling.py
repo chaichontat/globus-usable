@@ -227,3 +227,50 @@ def test_poll_tasks_abort_on_error_ignores_already_completed_cancel_error(
         )
     assert "failed to cancel" not in str(excinfo.value).lower()
     assert set(canceled) == {"BAD", "OK"}
+
+
+def test_poll_tasks_aborts_on_file_not_found_event_even_without_abort_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("globus_usable.progress.time.sleep", lambda _: None)
+    canceled: list[str] = []
+    calls = defaultdict(int)
+
+    def runner(*args: str) -> str:
+        if args[:2] == ("task", "show"):
+            task_id = args[2]
+            calls[task_id] += 1
+            status = "ACTIVE" if calls[task_id] == 1 else "SUCCEEDED"
+            done = 0 if status == "ACTIVE" else 1
+            return json.dumps(
+                {
+                    "status": status,
+                    "nice_status": status,
+                    "bytes_transferred": 0,
+                    "subtasks_total": 1,
+                    "subtasks_succeeded": done,
+                    "effective_bytes_per_second": 0,
+                }
+            )
+        if args[:2] == ("task", "event-list"):
+            task_id = args[-1]
+            if task_id == "BAD":
+                return json.dumps(
+                    {"DATA": [{"code": "FILE_NOT_FOUND", "description": "FILE_NOT_FOUND", "is_error": True}]}
+                )
+            return json.dumps({"DATA": []})
+        if args[:2] == ("task", "cancel"):
+            canceled.append(args[2])
+            return ""
+        raise AssertionError(args)
+
+    with pytest.raises(GlobusUsableError, match="FILE_NOT_FOUND"):
+        poll_tasks(
+            runner,
+            [TaskSpec(task_id="BAD", label="bad"), TaskSpec(task_id="OK", label="ok")],
+            mode="quiet",
+            poll_min=0.0,
+            poll_max=0.0,
+            abort_on_error=False,
+        )
+    assert set(canceled) == {"BAD", "OK"}

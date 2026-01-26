@@ -37,6 +37,12 @@ Copy remote → local:
 globus-usable cp dsai:/data/results.csv ./downloads/
 ```
 
+Copy remote → remote:
+
+```bash
+globus-usable cp dsai:/data/results.csv hpc:/scratch/
+```
+
 Copy a directory (recursive):
 
 ```bash

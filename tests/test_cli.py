@@ -7,7 +7,9 @@ from click.testing import CliRunner
 import pytest
 
 from globus_usable.cli_app import cli
+from globus_usable.config import Config, Defaults
 from globus_usable.config import load_config
+from globus_usable.transfer import TransferRequest
 
 
 def test_cp_dereference_default_true_flag_is_toggleable() -> None:
@@ -98,6 +100,45 @@ def test_config_init_prompts_for_autopopulate_and_can_decline(
     assert cfg.local_endpoint_id == "local-ep"
 
 
+def test_config_init_interactive_autopopulate_allows_selecting_subset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_globus(*args: str) -> str:
+        if args[:2] == ("endpoint", "local-id"):
+            return "local-ep\n"
+        if args[:2] == ("endpoint", "search"):
+            scope = args[args.index("--filter-scope") + 1]
+            if scope == "my-endpoints":
+                return (
+                    '{"DATA": ['
+                    '{"id": "11111111-1111-1111-1111-111111111111", "display_name": "Alpha Collection", "entity_type": "GCSv5_mapped_collection"},'
+                    '{"id": "22222222-2222-2222-2222-222222222222", "display_name": "Beta Collection", "entity_type": "GCSv5_mapped_collection"}'
+                    "]}"
+                )
+            return '{"DATA": []}'
+        raise AssertionError(f"Unexpected globus invocation: {args!r}")
+
+    monkeypatch.setattr("click.testing._NamedTextIOWrapper.isatty", lambda self: True)
+    monkeypatch.setattr("globus_usable.cli_app.run_globus", fake_run_globus)
+    monkeypatch.setattr(
+        "globus_usable.cli_app._select_linked_collections_interactive",
+        lambda initial: [initial[1]],
+    )
+
+    config_path = tmp_path / "remotes.toml"
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["config", "init", "--path", str(config_path), "--force", "--autopopulate-linked-collections"],
+    )
+    assert result.exit_code == 0, result.output
+
+    cfg = load_config(config_path)
+    assert cfg.remotes == {"beta-collection": "22222222-2222-2222-2222-222222222222"}
+    assert cfg.local_endpoint_id == "local-ep"
+
+
 def test_config_init_warns_when_local_endpoint_not_available(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -156,3 +197,88 @@ poll_interval_max = 20
     assert "sync_level = size" in result.output
     assert "poll_interval_min = 3" in result.output
     assert "poll_interval_max = 20" in result.output
+
+
+def test_cp_ctrl_c_prompts_keep_running_default_yes(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = Config(local_endpoint_id="LOCAL", remotes={"dsai": "REMOTE"}, defaults=Defaults())
+    monkeypatch.setattr("globus_usable.cli_app.load_config", lambda: cfg)
+    monkeypatch.setattr("click.testing._NamedTextIOWrapper.isatty", lambda self: True)
+
+    monkeypatch.setattr(
+        "globus_usable.cli_app.build_transfer_requests",
+        lambda *_args, **_kwargs: [
+            TransferRequest(
+                src_ep="A",
+                src_path="/src",
+                dst_ep="B",
+                dst_path="/dst",
+                recursive=False,
+                sync_level="mtime",
+                label="x",
+            )
+        ],
+    )
+    monkeypatch.setattr("globus_usable.cli_app.submit_transfer", lambda *_args, **_kwargs: "T1")
+
+    def fake_poll_tasks(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("globus_usable.cli_app.poll_tasks", fake_poll_tasks)
+
+    canceled: list[str] = []
+
+    def fake_run_globus(*args: str) -> str:
+        if args[:2] == ("task", "cancel"):
+            canceled.append(args[2])
+            return ""
+        return ""
+
+    monkeypatch.setattr("globus_usable.cli_app.run_globus", fake_run_globus)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["cp", "src", "dsai:/dst"], input="\n")
+    assert result.exit_code == 0, result.output
+    assert "Keep transfer task" in result.output
+    assert "Leaving transfer task" in result.output
+    assert canceled == []
+
+
+def test_cp_ctrl_c_second_interrupt_assumes_keep_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = Config(local_endpoint_id="LOCAL", remotes={"dsai": "REMOTE"}, defaults=Defaults())
+    monkeypatch.setattr("globus_usable.cli_app.load_config", lambda: cfg)
+    monkeypatch.setattr("click.testing._NamedTextIOWrapper.isatty", lambda self: True)
+
+    monkeypatch.setattr(
+        "globus_usable.cli_app.build_transfer_requests",
+        lambda *_args, **_kwargs: [
+            TransferRequest(
+                src_ep="A",
+                src_path="/src",
+                dst_ep="B",
+                dst_path="/dst",
+                recursive=False,
+                sync_level="mtime",
+                label="x",
+            )
+        ],
+    )
+    monkeypatch.setattr("globus_usable.cli_app.submit_transfer", lambda *_args, **_kwargs: "T1")
+
+    def fake_poll_tasks(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("globus_usable.cli_app.poll_tasks", fake_poll_tasks)
+
+    monkeypatch.setattr("globus_usable.cli_app.click.confirm", lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()))
+
+    canceled: list[str] = []
+    monkeypatch.setattr(
+        "globus_usable.cli_app.run_globus",
+        lambda *args: (canceled.append(args[2]) or "") if args[:2] == ("task", "cancel") else "",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["cp", "src", "dsai:/dst"])
+    assert result.exit_code == 0, result.output
+    assert "Leaving transfer task" in result.output
+    assert canceled == []

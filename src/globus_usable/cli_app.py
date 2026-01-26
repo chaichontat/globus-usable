@@ -7,6 +7,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import questionary
 import rich_click as click
 
 from .config import (
@@ -22,7 +23,13 @@ from .globus_cli import parse_json
 from .log import configure_logger
 from .metrics import clamp_percent
 from .progress import TaskSpec, poll_tasks
-from .transfer import normalize_remote_path, parse_path, run_copy, run_globus
+from .transfer import (
+    build_transfer_requests,
+    normalize_remote_path,
+    parse_path,
+    run_globus,
+    submit_transfer,
+)
 from .units import GIB, MIB
 
 click.rich_click.TEXT_MARKUP = "rich"
@@ -118,7 +125,7 @@ def cp(
     quiet: bool,
     json_mode: bool,
 ) -> None:
-    """Copy files between local and remote endpoints."""
+    """Copy files between local and remote endpoints (including remote-to-remote)."""
     if quiet and json_mode:
         raise click.ClickException("Use only one of --quiet or --json.")
 
@@ -127,7 +134,8 @@ def cp(
         ctx = click.get_current_context()
         if ctx.get_parameter_source("sync_level") == click.core.ParameterSource.DEFAULT:
             sync_level = cfg.defaults.sync_level
-        run_copy(
+
+        requests = build_transfer_requests(
             run_globus,
             cfg,
             src=src,
@@ -136,10 +144,103 @@ def cp(
             sync_level=sync_level,
             dereference=dereference,
             no_links=no_links,
-            continue_on_error=continue_on_error,
-            quiet=quiet,
-            json_mode=json_mode,
         )
+
+        task_specs: list[TaskSpec] = []
+        is_glob_loop = len(requests) > 1
+        for req in requests:
+            try:
+                task_id = submit_transfer(run_globus, req)
+            except GlobusUsableError as exc:
+                if not is_glob_loop:
+                    raise
+                click.echo(
+                    f"warning: failed to submit transfer for {req.label}: {exc}",
+                    err=True,
+                )
+                continue
+            task_specs.append(
+                TaskSpec(task_id=task_id, label=req.label, src=req.src_path, dst=req.dst_path)
+            )
+
+        if not task_specs:
+            raise GlobusUsableError("Failed to submit any transfer tasks.")
+
+        if quiet:
+            mode = "quiet"
+        elif json_mode:
+            mode = "json"
+        else:
+            mode = "interactive"
+
+        try:
+            result = poll_tasks(
+                run_globus,
+                task_specs,
+                mode=mode,
+                poll_min=cfg.defaults.poll_interval_min,
+                poll_max=cfg.defaults.poll_interval_max,
+                abort_on_error=not continue_on_error,
+            )
+        except KeyboardInterrupt:
+            if not task_specs:
+                raise
+
+            keep_running = True
+            if not json_mode and sys.stdin is not None and sys.stdin.isatty():
+                try:
+                    keep_running = click.confirm(
+                        "Keep transfer task(s) running in the background?",
+                        default=True,
+                    )
+                except KeyboardInterrupt:
+                    keep_running = True
+
+            task_ids = ", ".join(t.task_id for t in task_specs)
+            if keep_running:
+                click.echo(f"\nLeaving transfer task(s) running: {task_ids}", err=json_mode)
+                return
+
+            cancel_failures: list[str] = []
+            for t in task_specs:
+                try:
+                    run_globus("task", "cancel", t.task_id)
+                except GlobusUsableError as exc:
+                    text = str(exc).lower()
+                    if (
+                        "not active" in text
+                        or "already completed" in text
+                        or "already inactive" in text
+                        or "not cancellable" in text
+                        or "cannot be cancelled" in text
+                        or "cannot be canceled" in text
+                    ):
+                        continue
+                    cancel_failures.append(f"{t.task_id}: {exc}")
+
+            if cancel_failures:
+                details = "; ".join(cancel_failures[:3])
+                if len(cancel_failures) > 3:
+                    details = f"{details}; ..."
+                raise click.ClickException(f"Failed to cancel transfer task(s): {details}")
+
+            click.echo(f"\nCancelled transfer task(s): {task_ids}", err=json_mode)
+            return
+
+        if quiet:
+            if result.errors:
+                messages = "; ".join(sorted(result.errors.values()))
+                raise GlobusUsableError(messages)
+            total_files = sum((t.get("files") or 0) for t in result.task_data.values())
+            total_bytes = sum((t.get("bytes_transferred") or 0) for t in result.task_data.values())
+            gb = total_bytes / GIB
+            sys.stdout.write(f"Transferred {total_files} files ({gb:.2f} GB)\n")
+            sys.stdout.flush()
+            return
+
+        if result.errors and continue_on_error:
+            messages = "; ".join(sorted(result.errors.values()))
+            raise GlobusUsableError(messages)
     except (ConfigError, GlobusUsableError) as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -371,6 +472,8 @@ def config_init(path: Path | None, force: bool, autopopulate_linked_collections:
     if autopopulate_linked_collections:
         try:
             collections = _discover_accessible_linked_collections()
+            if sys.stdin is not None and sys.stdin.isatty():
+                collections = _select_linked_collections_interactive(collections)
         except GlobusUsableError as exc:
             raise click.ClickException(str(exc)) from exc
 
@@ -427,7 +530,12 @@ def config_init(path: Path | None, force: bool, autopopulate_linked_collections:
         click.echo("  globus-usable config init --path /path/to/remotes.toml")
 
 
-def _discover_accessible_linked_collections() -> list[tuple[str, str]]:
+def _discover_accessible_linked_collections(
+    *,
+    scope: str = "my-endpoints",
+    fulltext: str | None = None,
+    limit: int = 1000,
+) -> list[tuple[str, str]]:
     items: list[tuple[str, str]] = []
     seen_ids: set[str] = set()
 
@@ -441,17 +549,23 @@ def _discover_accessible_linked_collections() -> list[tuple[str, str]]:
             or normalized == "gcsv4_share"
         )
 
-    out = run_globus(
+    args: list[str] = [
         "endpoint",
         "search",
         "--filter-scope",
-        "my-endpoints",
+        scope,
         "--limit",
-        "1000",
+        str(limit),
         "--format",
         "json",
-    )
-    data = _json_data(out, "searching my-endpoints for linked collections")
+    ]
+    if fulltext is not None and fulltext.strip():
+        args.append(fulltext)
+    out = run_globus(*args)
+    context = f"searching {scope} for linked collections"
+    if fulltext is not None and fulltext.strip():
+        context = f"{context} matching {fulltext!r}"
+    data = _json_data(out, context)
     for entry in data:
         if not isinstance(entry, dict):
             continue
@@ -470,3 +584,81 @@ def _discover_accessible_linked_collections() -> list[tuple[str, str]]:
 
     items.sort(key=lambda x: x[0].lower())
     return items
+
+
+def _select_linked_collections_interactive(
+    initial: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    items_by_id: dict[str, tuple[str, str]] = {
+        collection_id: (display_name, collection_id) for display_name, collection_id in initial
+    }
+    selected_ids: set[str] = set(items_by_id.keys())
+
+    while True:
+        choices: list[questionary.Choice] = []
+        for display_name, collection_id in sorted(items_by_id.values(), key=lambda x: x[0].lower()):
+            title = f"{display_name} ({collection_id})" if display_name != collection_id else collection_id
+            choices.append(
+                questionary.Choice(
+                    title=title,
+                    value=collection_id,
+                    checked=(collection_id in selected_ids),
+                )
+            )
+
+        picked = questionary.checkbox(
+            "Select collections to add to config ([space] toggles, [enter] confirms)",
+            choices=choices,
+        ).ask()
+        if picked is None:
+            return []
+        selected_ids = {v for v in picked if isinstance(v, str)}
+
+        want_search = questionary.confirm(
+            "Search for more collections/endpoints to add?",
+            default=False,
+        ).ask()
+        if not want_search:
+            break
+
+        term = questionary.text("Search term").ask()
+        if term is None or not term.strip():
+            continue
+
+        discovered = _discover_accessible_linked_collections(
+            scope="all",
+            fulltext=term,
+            limit=200,
+        )
+        additional = [
+            (display_name, collection_id)
+            for display_name, collection_id in discovered
+            if collection_id not in items_by_id
+        ]
+        if not additional:
+            click.echo("No additional linked collections found for that search term.")
+            continue
+
+        additional_by_id: dict[str, tuple[str, str]] = {cid: (name, cid) for name, cid in additional}
+        additional_choices: list[questionary.Choice] = []
+        for display_name, collection_id in sorted(additional, key=lambda x: x[0].lower()):
+            title = f"{display_name} ({collection_id})" if display_name != collection_id else collection_id
+            additional_choices.append(questionary.Choice(title=title, value=collection_id, checked=False))
+
+        picked_additional = questionary.checkbox(
+            "Select additional collections/endpoints to add ([space] toggles, [enter] confirms)",
+            choices=additional_choices,
+        ).ask()
+        if picked_additional is None:
+            continue
+
+        picked_additional_ids = {v for v in picked_additional if isinstance(v, str)}
+        for collection_id in picked_additional_ids:
+            item = additional_by_id.get(collection_id)
+            if item is not None:
+                items_by_id[collection_id] = item
+        selected_ids |= picked_additional_ids
+
+    selected = [items_by_id[cid] for cid in selected_ids if cid in items_by_id]
+    selected.sort(key=lambda x: x[0].lower())
+    return selected

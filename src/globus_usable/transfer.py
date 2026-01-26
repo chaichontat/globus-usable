@@ -165,11 +165,60 @@ def ensure_local_parent(path: str) -> None:
     Path(path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
 
 
-def ensure_remote_parent(runner: Runner, endpoint_id: str, remote_path: str) -> None:
-    parent = posixpath.dirname(remote_path)
-    if parent in ("", ".", "/", "~"):
+def ensure_local_dir(path: str) -> None:
+    Path(path).expanduser().resolve().mkdir(parents=True, exist_ok=True)
+
+
+def _remote_dir_prefixes(path: str) -> list[str]:
+    p = path.rstrip("/")
+    if p in ("", ".", "/", "~"):
+        return []
+
+    if p.startswith("~/"):
+        current = "~"
+        rest = p[2:]
+    elif p.startswith("~"):
+        current = "~"
+        rest = p[1:].lstrip("/")
+    elif p.startswith("/"):
+        current = "/"
+        rest = p.lstrip("/")
+    else:
+        current = "~"
+        rest = p
+
+    prefixes: list[str] = []
+    for segment in rest.split("/"):
+        if not segment or segment == ".":
+            continue
+        if current == "/":
+            current = f"/{segment}"
+        elif current == "~":
+            current = f"~/{segment}"
+        else:
+            current = f"{current}/{segment}"
+        prefixes.append(current)
+    return prefixes
+
+
+def _is_remote_mkdir_exists_error(exc: GlobusUsableError) -> bool:
+    text = str(exc).lower()
+    return "mkdirfailed.exists" in text or "already exists" in text
+
+
+def ensure_remote_parent(
+    runner: Runner, endpoint_id: str, remote_path: str, *, target_is_dir: bool = False
+) -> None:
+    dir_path = remote_path if target_is_dir else posixpath.dirname(remote_path)
+    if dir_path in ("", ".", "/", "~"):
         return
-    runner("mkdir", f"{endpoint_id}:{parent}")
+    for prefix in _remote_dir_prefixes(dir_path):
+        try:
+            runner("mkdir", f"{endpoint_id}:{prefix}")
+        except GlobusUsableError as exc:
+            if _is_remote_mkdir_exists_error(exc):
+                continue
+            raise
 
 
 @dataclass(frozen=True)
@@ -214,10 +263,18 @@ def build_transfer_requests(
     parsed_src = parse_path(src, cfg)
     parsed_dst = parse_path(dst, cfg)
 
-    if parsed_src.is_remote and parsed_dst.is_remote:
-        raise GlobusUsableError("Remote-to-remote copies are not supported.")
     if (not parsed_src.is_remote) and (not parsed_dst.is_remote):
         raise GlobusUsableError("Source or destination must be remote (use <remote>:/path).")
+
+    if parsed_src.is_remote and parsed_dst.is_remote:
+        return build_remote_to_remote_requests(
+            runner,
+            cfg,
+            src=src,
+            dst=dst,
+            recursive=recursive,
+            sync_level=sync_level,
+        )
 
     local_ep = resolve_local_endpoint_id(cfg)
 
@@ -243,6 +300,62 @@ def build_transfer_requests(
         no_links=no_links,
         local_ep=local_ep,
     )
+
+
+def build_remote_to_remote_requests(
+    runner: Runner,
+    cfg: Config,
+    *,
+    src: str,
+    dst: str,
+    recursive: bool,
+    sync_level: str,
+) -> list[TransferRequest]:
+    parsed_src = parse_path(src, cfg)
+    parsed_dst = parse_path(dst, cfg)
+    if (not parsed_src.is_remote) or (not parsed_dst.is_remote):
+        raise GlobusUsableError("Expected remote source and destination.")
+
+    src_remote_name = parsed_src.remote or cfg.defaults.default_remote
+    dst_remote_name = parsed_dst.remote or cfg.defaults.default_remote
+    src_ep = resolve_remote_endpoint_id(cfg, src_remote_name)
+    dst_ep = resolve_remote_endpoint_id(cfg, dst_remote_name)
+
+    raw_src_remote = f"{src_remote_name}:{parsed_src.path or ''}"
+
+    dst_raw = parsed_dst.path or ""
+    if dst_raw == "/":
+        raw_dst_path = "/"
+    else:
+        raw_dst_path = normalize_remote_path(dst_raw.rstrip("/"))
+
+    if has_glob_magic(parsed_src.path or ""):
+        expanded = expand_remote_sources(runner, src_ep, raw_src_remote)
+        if not expanded:
+            raise GlobusUsableError(f"No matches found for pattern: {src}")
+    else:
+        expanded = [raw_src_remote]
+
+    requests: list[TransferRequest] = []
+    for expanded_src in expanded:
+        if expanded_src.endswith("/") and not recursive:
+            raise GlobusUsableError("Directory source requires -r/--recursive.")
+        _, expanded_path = expanded_src.split(":", 1)
+        src_norm = normalize_remote_path(expanded_path)
+        dst_path = rsync_dest(expanded_src, raw_dst_path, src_is_remote=True)
+        ensure_remote_parent(runner, dst_ep, dst_path, target_is_dir=expanded_src.endswith("/"))
+        requests.append(
+            TransferRequest(
+                src_ep=src_ep,
+                src_path=src_norm,
+                dst_ep=dst_ep,
+                dst_path=dst_path,
+                recursive=recursive,
+                sync_level=sync_level,
+                label=Path(expanded_path.rstrip("/")).name,
+            )
+        )
+    return requests
 
 
 def build_remote_to_local_requests(
@@ -272,10 +385,15 @@ def build_remote_to_local_requests(
 
     requests: list[TransferRequest] = []
     for expanded_src in expanded:
+        if expanded_src.endswith("/") and not recursive:
+            raise GlobusUsableError("Directory source requires -r/--recursive.")
         _, expanded_path = expanded_src.split(":", 1)
         src_norm = normalize_remote_path(expanded_path)
         dst_path = rsync_dest(expanded_src, local_dst_base, src_is_remote=True)
-        ensure_local_parent(dst_path)
+        if expanded_src.endswith("/"):
+            ensure_local_dir(dst_path)
+        else:
+            ensure_local_parent(dst_path)
         requests.append(
             TransferRequest(
                 src_ep=remote_ep,
@@ -324,6 +442,8 @@ def build_local_to_remote_requests(
     requests = []
     for expanded_src in expanded_sources:
         src_path = Path(expanded_src).expanduser().absolute()
+        if expanded_src.endswith("/") and not src_path.is_dir():
+            raise GlobusUsableError(f"Source ends with '/' but is not a directory: {expanded_src}")
         resolved_src = src_path
         if src_path.is_dir() and not recursive:
             raise GlobusUsableError("Directory source requires -r/--recursive.")
@@ -339,7 +459,7 @@ def build_local_to_remote_requests(
                 resolved_src = real
 
         dst_path = rsync_dest(expanded_src, raw_dst_path, src_is_remote=False)
-        ensure_remote_parent(runner, remote_ep, dst_path)
+        ensure_remote_parent(runner, remote_ep, dst_path, target_is_dir=resolved_src.is_dir())
         requests.append(
             TransferRequest(
                 src_ep=local_ep,
@@ -383,8 +503,15 @@ def run_copy(
     )
 
     task_specs: list[TaskSpec] = []
+    is_glob_loop = len(requests) > 1
     for req in requests:
-        task_id = submit_transfer(runner, req)
+        try:
+            task_id = submit_transfer(runner, req)
+        except GlobusUsableError as exc:
+            if not is_glob_loop:
+                raise
+            logger.warning(f"warning: failed to submit transfer for {req.label}: {exc}")
+            continue
         task_specs.append(
             TaskSpec(
                 task_id=task_id,
@@ -393,6 +520,9 @@ def run_copy(
                 dst=req.dst_path,
             )
         )
+
+    if not task_specs:
+        raise GlobusUsableError("Failed to submit any transfer tasks.")
 
     if quiet:
         mode = "quiet"

@@ -86,6 +86,199 @@ def test_build_transfer_requests_local_to_remote_creates_mkdir_and_transfer(tmp_
     assert ("mkdir", "REMOTE:/dest") in calls
 
 
+def test_build_transfer_requests_local_to_remote_mkdir_existing_is_ignored(tmp_path: Path) -> None:
+    src = tmp_path / "file.txt"
+    src.write_text("x", encoding="utf-8")
+
+    cfg = Config(local_endpoint_id="LOCAL", remotes={"dsai": "REMOTE"}, defaults=Defaults())
+
+    calls: list[tuple[str, ...]] = []
+
+    def runner(*args: str) -> str:
+        calls.append(tuple(args))
+        if args[0] == "mkdir":
+            raise GlobusUsableError(
+                "Globus CLI failed for `globus mkdir REMOTE:~/dest`: Globus CLI Error: "
+                "code: ExternalError.MkdirFailed.Exists message: Path '~/dest' already exists"
+            )
+        return ""
+
+    reqs = build_transfer_requests(
+        runner,
+        cfg,
+        src=str(src),
+        dst="dsai:dest/",
+        recursive=False,
+        sync_level="mtime",
+        dereference=True,
+        no_links=False,
+    )
+    assert len(reqs) == 1
+    assert reqs[0].dst_path.endswith("/dest/file.txt")
+    assert ("mkdir", "REMOTE:~/dest") in calls
+
+
+def test_build_transfer_requests_local_to_remote_creates_nested_remote_parents(tmp_path: Path) -> None:
+    src = tmp_path / "file.txt"
+    src.write_text("x", encoding="utf-8")
+
+    cfg = Config(local_endpoint_id="LOCAL", remotes={"dsai": "REMOTE"}, defaults=Defaults())
+
+    calls: list[tuple[str, ...]] = []
+
+    def runner(*args: str) -> str:
+        calls.append(tuple(args))
+        return ""
+
+    reqs = build_transfer_requests(
+        runner,
+        cfg,
+        src=str(src),
+        dst="dsai:/a/b/c",
+        recursive=False,
+        sync_level="mtime",
+        dereference=True,
+        no_links=False,
+    )
+    assert len(reqs) == 1
+    assert reqs[0].dst_path.endswith("/a/b/c/file.txt")
+    assert calls[:3] == [
+        ("mkdir", "REMOTE:/a"),
+        ("mkdir", "REMOTE:/a/b"),
+        ("mkdir", "REMOTE:/a/b/c"),
+    ]
+
+
+def test_build_transfer_requests_local_to_remote_src_trailing_slash_creates_dest_dir(tmp_path: Path) -> None:
+    src_dir = tmp_path / "srcdir"
+    src_dir.mkdir()
+    (src_dir / "file.txt").write_text("x", encoding="utf-8")
+
+    cfg = Config(local_endpoint_id="LOCAL", remotes={"dsai": "REMOTE"}, defaults=Defaults())
+
+    calls: list[tuple[str, ...]] = []
+
+    def runner(*args: str) -> str:
+        calls.append(tuple(args))
+        return ""
+
+    reqs = build_transfer_requests(
+        runner,
+        cfg,
+        src=f"{src_dir}/",
+        dst="dsai:dest/",
+        recursive=True,
+        sync_level="mtime",
+        dereference=True,
+        no_links=False,
+    )
+    assert len(reqs) == 1
+    assert reqs[0].dst_path.endswith("/dest")
+    assert ("mkdir", "REMOTE:~/dest") in calls
+
+
+def test_build_transfer_requests_remote_to_local_src_trailing_slash_creates_dest_dir(tmp_path: Path) -> None:
+    cfg = Config(local_endpoint_id="LOCAL", remotes={"dsai": "REMOTE"}, defaults=Defaults())
+
+    dst_dir = tmp_path / "out"
+    assert not dst_dir.exists()
+
+    def runner(*args: str) -> str:
+        return ""
+
+    reqs = build_transfer_requests(
+        runner,
+        cfg,
+        src="dsai:/data/srcdir/",
+        dst=str(dst_dir),
+        recursive=True,
+        sync_level="mtime",
+        dereference=True,
+        no_links=False,
+    )
+    assert len(reqs) == 1
+    assert dst_dir.exists()
+    assert dst_dir.is_dir()
+
+
+def test_build_transfer_requests_remote_to_local_directory_without_recursive_errors(tmp_path: Path) -> None:
+    cfg = Config(local_endpoint_id="LOCAL", remotes={"dsai": "REMOTE"}, defaults=Defaults())
+
+    def runner(*args: str) -> str:
+        return ""
+
+    with pytest.raises(GlobusUsableError, match="requires -r/--recursive"):
+        build_transfer_requests(
+            runner,
+            cfg,
+            src="dsai:/data/srcdir/",
+            dst=str(tmp_path / "out"),
+            recursive=False,
+            sync_level="mtime",
+            dereference=True,
+            no_links=False,
+        )
+
+
+def test_build_transfer_requests_remote_to_remote_does_not_require_local_endpoint() -> None:
+    cfg = Config(
+        local_endpoint_id=None,
+        remotes={"a": "EPA", "b": "EPB"},
+        defaults=Defaults(default_remote="a"),
+    )
+
+    calls: list[tuple[str, ...]] = []
+
+    def runner(*args: str) -> str:
+        calls.append(tuple(args))
+        return ""
+
+    reqs = build_transfer_requests(
+        runner,
+        cfg,
+        src="a:/data/file.txt",
+        dst="b:/dest",
+        recursive=False,
+        sync_level="mtime",
+        dereference=True,
+        no_links=False,
+    )
+    assert len(reqs) == 1
+    assert reqs[0].src_ep == "EPA"
+    assert reqs[0].dst_ep == "EPB"
+    assert reqs[0].src_path == "/data/file.txt"
+    assert reqs[0].dst_path == "/dest/file.txt"
+    assert ("mkdir", "EPB:/dest") in calls
+
+
+def test_build_transfer_requests_remote_to_remote_src_trailing_slash_creates_dest_dir() -> None:
+    cfg = Config(
+        local_endpoint_id=None,
+        remotes={"a": "EPA", "b": "EPB"},
+        defaults=Defaults(default_remote="a"),
+    )
+
+    calls: list[tuple[str, ...]] = []
+
+    def runner(*args: str) -> str:
+        calls.append(tuple(args))
+        return ""
+
+    reqs = build_transfer_requests(
+        runner,
+        cfg,
+        src="a:/data/srcdir/",
+        dst="b:/dest/",
+        recursive=True,
+        sync_level="mtime",
+        dereference=True,
+        no_links=False,
+    )
+    assert len(reqs) == 1
+    assert reqs[0].dst_path == "/dest"
+    assert ("mkdir", "EPB:/dest") in calls
+
+
 def test_build_transfer_requests_local_to_remote_root_does_not_mkdir_root(tmp_path: Path) -> None:
     src = tmp_path / "file.txt"
     src.write_text("x", encoding="utf-8")
@@ -277,3 +470,52 @@ def test_run_copy_quiet_prints_summary(
     )
     out = capsys.readouterr().out
     assert "Transferred" in out
+
+
+def test_run_copy_glob_submit_error_skips_and_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "a.txt").write_text("a", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("b", encoding="utf-8")
+
+    cfg = Config(local_endpoint_id="LOCAL", remotes={"dsai": "REMOTE"}, defaults=Defaults())
+
+    transfer_calls = 0
+
+    def runner(*args: str) -> str:
+        nonlocal transfer_calls
+        if args[0] == "mkdir":
+            return ""
+        if args[0] == "transfer":
+            transfer_calls += 1
+            if transfer_calls == 1:
+                return '{"task_id":"T1"}'
+            raise GlobusUsableError("submit failed")
+        raise AssertionError(args)
+
+    def fake_poll_tasks(_runner, task_specs, **_kwargs):
+        specs = list(task_specs)
+        assert [t.task_id for t in specs] == ["T1"]
+        return PollResult(
+            task_data={"T1": {"files": 2, "bytes_transferred": 2048}},
+            errors={},
+        )
+
+    monkeypatch.setattr("globus_usable.transfer.poll_tasks", fake_poll_tasks)
+
+    run_copy(
+        runner,
+        cfg,
+        src=str(tmp_path / "*.txt"),
+        dst="dsai:/dest",
+        recursive=False,
+        sync_level="mtime",
+        dereference=True,
+        no_links=False,
+        continue_on_error=False,
+        quiet=True,
+        json_mode=False,
+    )
+
+    assert transfer_calls == 2
+    assert "Transferred" in capsys.readouterr().out

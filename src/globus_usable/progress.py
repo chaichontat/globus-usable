@@ -92,6 +92,20 @@ def latest_error_message(runner: Runner, task_id: str) -> str | None:
     return f"{desc}: {details}" if details else desc
 
 
+def _format_event_message(ev: dict) -> str:
+    desc = ev.get("description") or ev.get("code") or "Error"
+    details = ev.get("details")
+    if isinstance(details, str):
+        try:
+            parsed = json.loads(details)
+            body = parsed.get("error", {}).get("body") if isinstance(parsed, dict) else None
+            if body:
+                details = body
+        except json.JSONDecodeError:
+            pass
+    return f"{desc}: {details}" if details else str(desc)
+
+
 def next_poll_interval(
     current: float, poll_min: float, poll_max: float, progress_made: bool
 ) -> float:
@@ -111,6 +125,22 @@ def _run_poll_loop(
     progress_ui: Progress | None,
     progress_tasks: dict[str, int],
 ) -> None:
+    def abort_all(msg: str) -> None:
+        cancel_failures: list[str] = []
+        for tid in list(state.active):
+            try:
+                runner("task", "cancel", tid)
+            except GlobusUsableError as exc:
+                if _is_already_completed_cancel_error(exc):
+                    continue
+                cancel_failures.append(f"{tid}: {exc}")
+        if cancel_failures:
+            details = "; ".join(cancel_failures[:3])
+            if len(cancel_failures) > 3:
+                details = f"{details}; ..."
+            raise GlobusUsableError(f"{msg} (also failed to cancel: {details})")
+        raise GlobusUsableError(msg)
+
     while state.active:
         progress_made = False
         for task_id in list(state.active):
@@ -173,20 +203,7 @@ def _run_poll_loop(
                 elif mode == "json":
                     _emit_ndjson({"type": "error", "task_id": task_id, "message": msg})
                 if abort_on_error:
-                    cancel_failures: list[str] = []
-                    for tid in list(state.active):
-                        try:
-                            runner("task", "cancel", tid)
-                        except GlobusUsableError as exc:
-                            if _is_already_completed_cancel_error(exc):
-                                continue
-                            cancel_failures.append(f"{tid}: {exc}")
-                    if cancel_failures:
-                        details = "; ".join(cancel_failures[:3])
-                        if len(cancel_failures) > 3:
-                            details = f"{details}; ..."
-                        raise GlobusUsableError(f"{msg} (also failed to cancel: {details})")
-                    raise GlobusUsableError(msg)
+                    abort_all(msg)
 
             if t.get("status") != STATUS_ACTIVE:
                 if progress_ui:
@@ -223,6 +240,20 @@ def _run_poll_loop(
                 seen_for_task = state.seen_events.setdefault(task_id, set())
                 label = state.labels.get(task_id, task_id)
                 for ev in reversed(events):
+                    code = ev.get("code")
+                    if (
+                        isinstance(code, str)
+                        and code.strip().upper() == "FILE_NOT_FOUND"
+                        and task_id not in state.errors
+                    ):
+                        msg = _format_event_message(ev)
+                        state.errors[task_id] = msg
+                        if progress_ui:
+                            progress_ui.update(progress_tasks[task_id], description=f"[red]{msg}")
+                        elif mode == "json":
+                            _emit_ndjson({"type": "error", "task_id": task_id, "message": msg})
+                        abort_all(msg)
+
                     key = (
                         ev.get("time", ""),
                         ev.get("code", ""),
